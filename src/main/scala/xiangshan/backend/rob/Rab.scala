@@ -7,8 +7,10 @@ import xiangshan._
 import utils._
 import utility._
 import xiangshan.backend.Bundles.DynInst
+import xiangshan.backend.{RabToVecExcpMod, RegWriteFromRab}
 import xiangshan.backend.decode.VectorConstants
 import xiangshan.backend.rename.SnapshotGenerator
+import chisel3.experimental.BundleLiterals._
 
 class RenameBufferPtr(size: Int) extends CircularQueuePtr[RenameBufferPtr](size) {
   def this()(implicit p: Parameters) = this(p(XSCoreParamsKey).RabSize)
@@ -38,6 +40,10 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
       val walkSize = Input(UInt(log2Up(size).W))
       val walkEnd = Input(Bool())
       val commitSize = Input(UInt(log2Up(size).W))
+      val vecLoadExcp = Input(ValidIO(new Bundle{
+        val isStrided = Bool()
+        val isVlm = Bool()
+      }))
     }
 
     val snpt = Input(new SnapshotPort)
@@ -46,11 +52,12 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
     val enqPtrVec = Output(Vec(RenameWidth, new RenameBufferPtr))
 
     val commits = Output(new RabCommitIO)
-    val diffCommits = if (backendParams.debugEn) Some(Output(new DiffCommitIO)) else None
+    val diffCommits = if (backendParams.basicDebugEn) Some(Output(new DiffCommitIO)) else None
 
     val status = Output(new Bundle {
       val walkEnd = Bool()
     })
+    val toVecExcpMod = Output(new RabToVecExcpMod)
   })
 
   // alias
@@ -91,6 +98,12 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
   val renameBuffer = Reg(Vec(size, new RenameBufferEntry))
   val renameBufferEntries = VecInit((0 until size) map (i => renameBuffer(i)))
 
+  val vecLoadExcp = Reg(io.fromRob.vecLoadExcp.cloneType)
+
+  private val maxLMUL = 8
+  private val vdIdxWidth = log2Up(maxLMUL + 1)
+  val currentVdIdx = Reg(UInt(vdIdxWidth.W)) // store 0~8
+
   val s_idle :: s_special_walk :: s_walk :: Nil = Enum(3)
   val state = RegInit(s_idle)
   val stateNext = WireInit(state) // otherwise keep state value
@@ -106,13 +119,13 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
 
   val realNeedAlloc = io.req.map(req => req.valid && req.bits.needWriteRf)
   val enqCount    = PopCount(realNeedAlloc)
-  val commitNum = Wire(UInt(3.W))
-  val walkNum = Wire(UInt(3.W))
-  commitNum := Mux(io.commits.commitValid(0), PriorityMux((0 until 6).map(
-    i => io.commits.commitValid(5-i) -> (6-i).U
+  val commitNum = Wire(UInt(log2Up(RabCommitWidth).W))
+  val walkNum = Wire(UInt(log2Up(RabCommitWidth).W))
+  commitNum := Mux(io.commits.commitValid(0), PriorityMux((0 until RabCommitWidth).map(
+    i => io.commits.commitValid(RabCommitWidth - 1 - i) -> (RabCommitWidth - i).U
   )), 0.U)
-  walkNum := Mux(io.commits.walkValid(0), PriorityMux((0 until 6).map(
-    i => io.commits.walkValid(5-i) -> (6-i).U
+  walkNum := Mux(io.commits.walkValid(0), PriorityMux((0 until RabCommitWidth).map(
+    i => io.commits.walkValid(RabCommitWidth - 1 - i) -> (RabCommitWidth-i).U
   )), 0.U)
   val commitCount = Mux(io.commits.isCommit && !io.commits.isWalk, commitNum, 0.U)
   val walkCount   = Mux(io.commits.isWalk && !io.commits.isCommit, walkNum, 0.U)
@@ -150,7 +163,7 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
   val vcfgCandidates   = VecInit(vcfgPtrOHVec.map(sel => Mux1H(sel, renameBufferEntries)))
 
   // update diff pointer
-  diffPtrNext := Mux(state === s_idle, diffPtr + newCommitSize, diffPtr)
+  diffPtrNext := diffPtr + newCommitSize
   diffPtr := diffPtrNext
 
   // update vcfg pointer
@@ -216,6 +229,10 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
       stateNext := s_walk
     }.otherwise {
       stateNext := s_special_walk
+      vecLoadExcp := io.fromRob.vecLoadExcp
+      when(io.fromRob.vecLoadExcp.valid) {
+        currentVdIdx := 0.U
+      }
     }
   }.otherwise {
     // change stateNext
@@ -225,8 +242,10 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
         stateNext := s_idle
       }
       is(s_special_walk) {
+        currentVdIdx := currentVdIdx + specialWalkCount
         when(specialWalkEndNext) {
           stateNext := s_walk
+          vecLoadExcp.valid := false.B
         }
       }
       is(s_walk) {
@@ -244,6 +263,16 @@ class RenameBuffer(size: Int)(implicit p: Parameters) extends XSModule with HasC
   io.enqPtrVec := enqPtrVec
 
   io.status.walkEnd := walkEndNext
+
+  for (i <- 0 until RabCommitWidth) {
+    io.toVecExcpMod.logicPhyRegMap(i).valid := (state === s_special_walk) && vecLoadExcp.valid &&
+      io.commits.commitValid(i)
+    io.toVecExcpMod.logicPhyRegMap(i).bits match {
+      case x =>
+        x.lreg := io.commits.info(i).ldest
+        x.preg := io.commits.info(i).pdest
+    }
+  }
 
   // for difftest
   io.diffCommits.foreach(_ := 0.U.asTypeOf(new DiffCommitIO))

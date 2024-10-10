@@ -36,6 +36,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   val flushPipe = Wire(Bool())
   val flush = io.flush.valid
 
+  /** Alias of input signals */
   val (valid, src1, imm, func) = (
     io.in.valid,
     io.in.bits.data.src(0),
@@ -106,6 +107,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   csrMod.io.fetchMalTval := trapTvalMod.io.tval
   csrMod.io.fromMem.excpVA  := csrIn.memExceptionVAddr
   csrMod.io.fromMem.excpGPA := csrIn.memExceptionGPAddr
+  csrMod.io.fromMem.excpIsForVSnonLeafPTE := csrIn.memExceptionIsForVSnonLeafPTE
 
   csrMod.io.fromRob.trap.valid := csrIn.exception.valid
   csrMod.io.fromRob.trap.bits.pc := csrIn.exception.bits.pc
@@ -120,6 +122,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   csrMod.io.fromRob.trap.bits.trigger := csrIn.exception.bits.trigger
   csrMod.io.fromRob.trap.bits.isHls := csrIn.exception.bits.isHls
   csrMod.io.fromRob.trap.bits.isFetchMalAddr := csrIn.exception.bits.isFetchMalAddr
+  csrMod.io.fromRob.trap.bits.isForVSnonLeafPTE := csrIn.exception.bits.isForVSnonLeafPTE
 
   csrMod.io.fromRob.commit.fflags := setFflags
   csrMod.io.fromRob.commit.fsDirty := setFsDirty
@@ -141,6 +144,8 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
 
   csrMod.io.fromRob.robDeqPtr := csrIn.robDeqPtr
 
+  csrMod.io.fromVecExcpMod.busy := io.csrin.get.fromVecExcpMod.busy
+
   csrMod.io.perf  := csrIn.perf
 
   csrMod.platformIRP.MEIP := csrIn.externalInterrupt.meip
@@ -151,7 +156,8 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   csrMod.platformIRP.VSEIP := false.B // Todo
   csrMod.platformIRP.VSTIP := false.B // Todo
   csrMod.platformIRP.debugIP := csrIn.externalInterrupt.debug
-  csrMod.nonMaskableIRP.NMI := csrIn.externalInterrupt.nmi.nmi
+  csrMod.nonMaskableIRP.NMI_43 := csrIn.externalInterrupt.nmi.nmi_43
+  csrMod.nonMaskableIRP.NMI_31 := csrIn.externalInterrupt.nmi.nmi_31
 
   csrMod.io.fromTop.hartId := io.csrin.get.hartId
   csrMod.io.fromTop.clintTime := io.csrin.get.clintTime
@@ -206,11 +212,11 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
 
   private val exceptionVec = WireInit(0.U.asTypeOf(ExceptionVec())) // Todo:
 
-  exceptionVec(EX_BP    ) := isEbreak
-  exceptionVec(EX_MCALL ) := isEcall && privState.isModeM
-  exceptionVec(EX_HSCALL) := isEcall && privState.isModeHS
-  exceptionVec(EX_VSCALL) := isEcall && privState.isModeVS
-  exceptionVec(EX_UCALL ) := isEcall && privState.isModeHUorVU
+  exceptionVec(EX_BP    ) := DataHoldBypass(isEbreak, false.B, io.in.fire)
+  exceptionVec(EX_MCALL ) := DataHoldBypass(isEcall && privState.isModeM, false.B, io.in.fire)
+  exceptionVec(EX_HSCALL) := DataHoldBypass(isEcall && privState.isModeHS, false.B, io.in.fire)
+  exceptionVec(EX_VSCALL) := DataHoldBypass(isEcall && privState.isModeVS, false.B, io.in.fire)
+  exceptionVec(EX_UCALL ) := DataHoldBypass(isEcall && privState.isModeHUorVU, false.B, io.in.fire)
   exceptionVec(EX_II    ) := csrMod.io.out.bits.EX_II
   exceptionVec(EX_VI    ) := csrMod.io.out.bits.EX_VI
 
@@ -254,13 +260,17 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   tlb.mPBMTE := csrMod.io.tlb.mPBMTE
   tlb.hPBMTE := csrMod.io.tlb.hPBMTE
 
-  io.in.ready := true.B // Todo: Async read imsic may block CSR
+  /** Since some CSR read instructions are allowed to be pipelined, ready/valid signals should be modified */
+  io.in.ready := csrMod.io.in.ready // Todo: Async read imsic may block CSR
   io.out.valid := csrModOutValid
   io.out.bits.ctrl.exceptionVec.get := exceptionVec
   io.out.bits.ctrl.flushPipe.get := flushPipe
   io.out.bits.res.data := csrMod.io.out.bits.rData
 
-  io.out.bits.res.redirect.get.valid := isXRet
+  /** initialize NewCSR's io_out_ready from wrapper's io */
+  csrMod.io.out.ready := io.out.ready
+
+  io.out.bits.res.redirect.get.valid := io.out.valid && DataHoldBypass(isXRet, false.B, io.in.fire)
   val redirect = io.out.bits.res.redirect.get.bits
   redirect := 0.U.asTypeOf(redirect)
   redirect.level := RedirectLevel.flushAfter
@@ -276,10 +286,10 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   // Only mispred will send redirect to frontend
   redirect.cfiUpdate.isMisPred := true.B
 
-  connect0LatencyCtrlSingal
+  connectNonPipedCtrlSingalForCSR
 
   // Todo: summerize all difftest skip condition
-  csrOut.isPerfCnt  := csrMod.io.out.bits.isPerfCnt && csrModOutValid && func =/= CSROpType.jmp
+  csrOut.isPerfCnt  := io.out.valid && csrMod.io.out.bits.isPerfCnt && DataHoldBypass(func =/= CSROpType.jmp, false.B, io.in.fire)
   csrOut.fpu.frm    := csrMod.io.status.fpState.frm.asUInt
   csrOut.vpu.vstart := csrMod.io.status.vecState.vstart.asUInt
   csrOut.vpu.vxrm   := csrMod.io.status.vecState.vxrm.asUInt
@@ -329,7 +339,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
       custom.wfi_enable               := csrMod.io.status.custom.wfi_enable
       // distribute csr write signal
       // write to frontend and memory
-      custom.distribute_csr.w.valid := csrWen
+      custom.distribute_csr.w.valid := csrMod.io.distributedWenLegal
       custom.distribute_csr.w.bits.addr := addr
       custom.distribute_csr.w.bits.data := wdata
       // rename single step
@@ -351,6 +361,9 @@ class CSRInput(implicit p: Parameters) extends XSBundle with HasSoCParameter{
   val msiInfo = Input(ValidIO(new MsiInfoBundle))
   val clintTime = Input(ValidIO(UInt(64.W)))
   val trapInstInfo = Input(ValidIO(new TrapInstInfo))
+  val fromVecExcpMod = Input(new Bundle {
+    val busy = Bool()
+  })
 }
 
 class CSRToDecode(implicit p: Parameters) extends XSBundle {
@@ -409,7 +422,26 @@ class CSRToDecode(implicit p: Parameters) extends XSBundle {
      * raise EX_II when frm.data > 4
      */
     val frm = Bool()
+
+    /**
+     * illegal CBO.ZERO
+     * raise [[EX_II]] when !isModeM && !MEnvCfg.CBZE || isModeHU && !SEnvCfg.CBZE
+     */
+    val cboZ = Bool()
+
+    /**
+     * illegal CBO.CLEAN/FLUSH
+     * raise [[EX_II]] when !isModeM && !MEnvCfg.CBCFE || isModeHU && !SEnvCfg.CBCFE
+     */
+    val cboCF = Bool()
+
+    /**
+     * illegal CBO.INVAL
+     * raise [[EX_II]] when !isModeM && MEnvCfg.CBIE = EnvCBIE.Off || isModeHU && SEnvCfg.CBIE = EnvCBIE.Off
+     */
+    val cboI = Bool()
   }
+
   val virtualInst = new Bundle {
     /**
      * illegal sfence.vma, svinval.vma
@@ -440,5 +472,37 @@ class CSRToDecode(implicit p: Parameters) extends XSBundle {
      * raise EX_VI when isModeVU && mstatus.TW=0 || isModeVS && mstatus.TW=0 && hstatus.VTW=1
      */
     val wfi = Bool()
+
+    /**
+     * illegal CBO.ZERO
+     * raise [[EX_VI]] when MEnvCfg.CBZE && (isModeVS && !HEnvCfg.CBZE || isModeVU && (!HEnvCfg.CBZE || !SEnvCfg.CBZE))
+     */
+    val cboZ = Bool()
+
+    /**
+     * illegal CBO.CLEAN/FLUSH
+     * raise [[EX_VI]] when MEnvCfg.CBZE && (isModeVS && !HEnvCfg.CBCFE || isModeVU && (!HEnvCfg.CBCFE || !SEnvCfg.CBCFE))
+     */
+    val cboCF = Bool()
+
+    /**
+     * illegal CBO.INVAL <br/>
+     * raise [[EX_VI]] when MEnvCfg.CBIE =/= EnvCBIE.Off && ( <br/>
+     *   isModeVS && HEnvCfg.CBIE === EnvCBIE.Off || <br/>
+     *   isModeVU && (HEnvCfg.CBIE === EnvCBIE.Off || SEnvCfg.CBIE === EnvCBIE.Off) <br/>
+     * ) <br/>
+     */
+    val cboI = Bool()
+  }
+
+  val special = new Bundle {
+    /**
+     * execute CBO.INVAL and perform flush operation when <br/>
+     * isModeHS && MEnvCfg.CBIE === EnvCBIE.Flush || <br/>
+     * isModeHU && (MEnvCfg.CBIE === EnvCBIE.Flush || SEnvCfg.CBIE === EnvCBIE.Flush) <br/>
+     * isModeVS && (MEnvCfg.CBIE === EnvCBIE.Flush || HEnvCfg.CBIE === EnvCBIE.Flush) <br/>
+     * isModeVU && (MEnvCfg.CBIE === EnvCBIE.Flush || HEnvCfg.CBIE === EnvCBIE.Flush || SEnvCfg.CBIE === EnvCBIE.Flush) <br/>
+     */
+    val cboI2F = Bool()
   }
 }

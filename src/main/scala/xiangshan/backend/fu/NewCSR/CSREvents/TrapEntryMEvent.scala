@@ -19,20 +19,7 @@ class TrapEntryMEventOutput extends Bundle with EventUpdatePrivStateOutput with 
   val mtval     = ValidIO((new OneFieldBundle).addInEvent(_.ALL))
   val mtval2    = ValidIO((new OneFieldBundle).addInEvent(_.ALL))
   val mtinst    = ValidIO((new OneFieldBundle).addInEvent(_.ALL))
-  val tcontrol  = ValidIO((new TcontrolBundle).addInEvent(_.MPTE, _.MTE))
   val targetPc  = ValidIO(new TargetPCBundle)
-
-  def getBundleByName(name: String): Valid[CSRBundle] = {
-    name match {
-      case "mstatus"  => this.mstatus
-      case "mepc"     => this.mepc
-      case "mcause"   => this.mcause
-      case "mtval"    => this.mtval
-      case "mtval2"   => this.mtval2
-      case "mtinst"   => this.mtinst
-      case "tcontrol" => this.tcontrol
-    }
-  }
 }
 
 class TrapEntryMEventModule(implicit val p: Parameters) extends Module with CSREventBase {
@@ -60,15 +47,9 @@ class TrapEntryMEventModule(implicit val p: Parameters) extends Module with CSRE
 
   private val trapPCGPA = SignExt(in.trapPcGPA, XLEN)
 
-  private val trapMemVA = genTrapVA(
-    dMode,
-    satp,
-    vsatp,
-    hgatp,
-    in.memExceptionVAddr,
-  )
+  private val trapMemVA = in.memExceptionVAddr
 
-  private val trapMemGPA = SignExt(in.memExceptionGPAddr, XLEN)
+  private val trapMemGPA = in.memExceptionGPAddr
 
   private val trapInst = Mux(in.trapInst.valid, in.trapInst.bits, 0.U)
 
@@ -122,7 +103,6 @@ class TrapEntryMEventModule(implicit val p: Parameters) extends Module with CSRE
   out.mtval    .valid := valid
   out.mtval2   .valid := valid
   out.mtinst   .valid := valid
-  out.tcontrol .valid := valid
   out.targetPc .valid := valid
 
   out.privState.bits            := PrivState.ModeM
@@ -136,9 +116,7 @@ class TrapEntryMEventModule(implicit val p: Parameters) extends Module with CSRE
   out.mcause.bits.ExceptionCode := highPrioTrapNO
   out.mtval.bits.ALL            := Mux(isFetchMalAddr, in.fetchMalTval, tval)
   out.mtval2.bits.ALL           := tval2 >> 2
-  out.mtinst.bits.ALL           := 0.U
-  out.tcontrol.bits.MPTE        := in.tcontrol.MTE
-  out.tcontrol.bits.MTE         := 0.U
+  out.mtinst.bits.ALL           := Mux(isFetchGuestExcp && in.trapIsForVSnonLeafPTE || isLSGuestExcp && in.memExceptionIsForVSnonLeafPTE, 0x3000.U, 0.U)
   out.targetPc.bits.pc          := in.pcFromXtvec
   out.targetPc.bits.raiseIPF    := false.B
   out.targetPc.bits.raiseIAF    := AddrTransType(bare = true).checkAccessFault(in.pcFromXtvec)
@@ -148,16 +126,10 @@ class TrapEntryMEventModule(implicit val p: Parameters) extends Module with CSRE
   dontTouch(tvalFillGVA)
 }
 
-trait TrapEntryMEventSinkBundle { self: CSRModule[_] =>
+trait TrapEntryMEventSinkBundle extends EventSinkBundle { self: CSRModule[_ <: CSRBundle] =>
   val trapToM = IO(Flipped(new TrapEntryMEventOutput))
 
-  private val updateBundle: ValidIO[CSRBundle] = trapToM.getBundleByName(self.modName.toLowerCase())
+  addUpdateBundleInCSREnumType(trapToM.getBundleByName(self.modName.toLowerCase()))
 
-  (reg.asInstanceOf[CSRBundle].getFields zip updateBundle.bits.getFields).foreach { case (sink, source) =>
-    if (updateBundle.bits.eventFields.contains(source)) {
-      when(updateBundle.valid) {
-        sink := source
-      }
-    }
-  }
+  reconnectReg()
 }
